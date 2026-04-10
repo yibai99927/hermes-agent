@@ -71,6 +71,7 @@ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_cli.cwd import resolve_runtime_cwd
 from hermes_cli.env_loader import load_hermes_dotenv
 
 _hermes_home = get_hermes_home()
@@ -392,7 +393,7 @@ def load_cli_config() -> Dict[str, Any]:
     if terminal_config.get("cwd") in (".", "auto", "cwd"):
         effective_backend = terminal_config.get("env_type", "local")
         if effective_backend == "local":
-            terminal_config["cwd"] = os.getcwd()
+            terminal_config["cwd"] = resolve_runtime_cwd(terminal_config.get("cwd"))
             defaults["terminal"]["cwd"] = terminal_config["cwd"]
         else:
             # Remove so TERMINAL_CWD stays unset → tool picks backend default
@@ -1096,7 +1097,7 @@ def _resolve_attachment_path(raw_path: str) -> Path | None:
     expanded = os.path.expandvars(os.path.expanduser(token))
     path = Path(expanded)
     if not path.is_absolute():
-        base_dir = Path(os.getenv("TERMINAL_CWD", os.getcwd()))
+        base_dir = Path(resolve_runtime_cwd())
         path = base_dir / path
 
     try:
@@ -2733,7 +2734,7 @@ class HermesCLI:
             tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
             
             # Get terminal working directory (where commands will execute)
-            cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+            cwd = resolve_runtime_cwd()
             
             # Build and display the banner
             build_welcome_banner(
@@ -3042,7 +3043,7 @@ class HermesCLI:
             print("  Or in config.yaml: checkpoints: { enabled: true }")
             return
 
-        cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+        cwd = resolve_runtime_cwd()
         parts = command.split()
         args = parts[1:] if len(parts) > 1 else []
 
@@ -3503,7 +3504,7 @@ class HermesCLI:
         """Display current configuration with kawaii ASCII art."""
         # Get terminal config from environment (which was set from cli-config.yaml)
         terminal_env = os.getenv("TERMINAL_ENV", "local")
-        terminal_cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+        terminal_cwd = resolve_runtime_cwd()
         terminal_timeout = os.getenv("TERMINAL_TIMEOUT", "60")
         
         user_config_path = _hermes_home / 'config.yaml'
@@ -4677,7 +4678,7 @@ class HermesCLI:
                     cc.print(_build_compact_banner())
                 else:
                     tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
-                    cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+                    cwd = resolve_runtime_cwd()
                     ctx_len = None
                     if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
                         ctx_len = self.agent.context_compressor.context_length
@@ -6768,7 +6769,7 @@ class HermesCLI:
                 _ctx_len = get_model_context_length(
                     self.model, base_url=self.base_url or "", api_key=self.api_key or "")
                 _ctx_result = preprocess_context_references(
-                    message, cwd=os.getcwd(), context_length=_ctx_len)
+                    message, cwd=resolve_runtime_cwd(), context_length=_ctx_len)
                 if _ctx_result.expanded or _ctx_result.blocked:
                     if _ctx_result.references:
                         _cprint(

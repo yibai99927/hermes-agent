@@ -493,6 +493,14 @@ class TestBuildContextFilesPrompt:
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "type hints" in result
 
+    def test_uses_terminal_cwd_when_cwd_omitted(self, tmp_path, monkeypatch):
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        (project_dir / "AGENTS.md").write_text("Use uv for local Python tooling.")
+        monkeypatch.setenv("TERMINAL_CWD", str(project_dir))
+        result = build_context_files_prompt()
+        assert "Use uv for local Python tooling." in result
+
     def test_loads_soul_md_from_hermes_home_only(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
         hermes_home = tmp_path / "hermes_home"

@@ -1,5 +1,6 @@
 """Tests for agent.auxiliary_client resolution chain, provider overrides, and model overrides."""
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from agent.auxiliary_client import (
     resolve_provider_client,
     auxiliary_max_tokens_param,
     call_llm,
+    async_call_llm,
     _read_codex_access_token,
     _get_auxiliary_provider,
     _get_provider_chain,
@@ -1298,6 +1300,95 @@ class TestCallLlmResponsesApi:
         assert call_kwargs["input"][0]["role"] == "system"
         assert call_kwargs["input"][1]["role"] == "user"
         client.chat.completions.create.assert_not_called()
+
+    def test_gpt54_non_compression_routes_to_responses(self):
+        client = MagicMock()
+        raw_response = SimpleNamespace(
+            model="gpt-5.4-mini",
+            output_text="session summary",
+            usage=SimpleNamespace(input_tokens=8, output_tokens=5, total_tokens=13),
+        )
+        client.responses.create.return_value = raw_response
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(client, "gpt-5.4-mini")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("custom", "gpt-5.4-mini", "https://api.novacode.top/v1", "test-key")):
+            result = call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "Summarize prior sessions"}],
+            )
+
+        assert result.choices[0].message.content == "session summary"
+        client.responses.create.assert_called_once()
+        client.chat.completions.create.assert_not_called()
+
+    def test_gpt54_responses_unsupported_does_not_fallback_to_chat_completions(self):
+        client = MagicMock()
+        not_found = Exception("404 responses endpoint not found")
+        not_found.status_code = 404
+        client.responses.create.side_effect = not_found
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(client, "gpt-5.4")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("custom", "gpt-5.4", "https://api.novacode.top/v1", "test-key")):
+            with pytest.raises(RuntimeError, match="requires the Responses API"):
+                call_llm(
+                    task="session_search",
+                    messages=[{"role": "user", "content": "Summarize prior sessions"}],
+                )
+
+        client.responses.create.assert_called_once()
+        client.chat.completions.create.assert_not_called()
+
+    def test_async_gpt54_non_compression_routes_to_responses(self):
+        raw_response = SimpleNamespace(
+            model="gpt-5.4-nano",
+            output_text="async summary",
+            usage=SimpleNamespace(input_tokens=6, output_tokens=4, total_tokens=10),
+        )
+
+        class _AsyncResponses:
+            def __init__(self, response):
+                self.response = response
+                self.calls = []
+
+            async def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return self.response
+
+        class _AsyncCompletions:
+            def __init__(self):
+                self.calls = []
+
+            async def create(self, **kwargs):
+                self.calls.append(kwargs)
+                raise AssertionError("chat.completions should not be used for gpt-5.4 auxiliary requests")
+
+        class _AsyncChat:
+            def __init__(self):
+                self.completions = _AsyncCompletions()
+
+        class _AsyncClient:
+            def __init__(self, response):
+                self.responses = _AsyncResponses(response)
+                self.chat = _AsyncChat()
+
+        client = _AsyncClient(raw_response)
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(client, "gpt-5.4-nano")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("custom", "gpt-5.4-nano", "https://api.novacode.top/v1", "test-key")):
+            result = asyncio.run(async_call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "Summarize prior sessions"}],
+            ))
+
+        assert result.choices[0].message.content == "async summary"
+        assert len(client.responses.calls) == 1
+        assert client.chat.completions.calls == []
 
     def test_custom_responses_404_falls_back_to_chat_completions(self):
         client = MagicMock()

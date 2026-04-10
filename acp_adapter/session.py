@@ -9,6 +9,7 @@ history.
 from __future__ import annotations
 
 from hermes_constants import get_hermes_home
+from hermes_cli.cwd import resolve_runtime_cwd
 
 import copy
 import json
@@ -33,13 +34,18 @@ def _acp_stderr_print(*args, **kwargs) -> None:
     print(*args, **kwargs)
 
 
+def _normalize_session_cwd(cwd: str | None) -> str:
+    """Resolve persisted ACP cwd values into a safe absolute path."""
+    return resolve_runtime_cwd(cwd)
+
+
 def _register_task_cwd(task_id: str, cwd: str) -> None:
     """Bind a task/session id to the editor's working directory for tools."""
     if not task_id:
         return
     try:
         from tools.terminal_tool import register_task_env_overrides
-        register_task_env_overrides(task_id, {"cwd": cwd})
+        register_task_env_overrides(task_id, {"cwd": _normalize_session_cwd(cwd)})
     except Exception:
         logger.debug("Failed to register ACP task cwd override", exc_info=True)
 
@@ -96,6 +102,7 @@ class SessionManager:
         import threading
 
         session_id = str(uuid.uuid4())
+        cwd = _normalize_session_cwd(cwd)
         agent = self._make_agent(session_id=session_id, cwd=cwd)
         state = SessionState(
             session_id=session_id,
@@ -142,6 +149,7 @@ class SessionManager:
             return None
 
         new_id = str(uuid.uuid4())
+        cwd = _normalize_session_cwd(cwd)
         agent = self._make_agent(
             session_id=new_id,
             cwd=cwd,
@@ -191,7 +199,7 @@ class SessionManager:
                     mc = row.get("model_config")
                     if mc:
                         try:
-                            cwd = json.loads(mc).get("cwd", ".")
+                            cwd = _normalize_session_cwd(json.loads(mc).get("cwd", "."))
                         except (json.JSONDecodeError, TypeError):
                             pass
                     results.append({
@@ -210,6 +218,7 @@ class SessionManager:
         state = self.get_session(session_id)  # checks DB too
         if state is None:
             return None
+        cwd = _normalize_session_cwd(cwd)
         state.cwd = cwd
         _register_task_cwd(session_id, cwd)
         self._persist(state)
@@ -352,7 +361,7 @@ class SessionManager:
             return None
 
         # Extract cwd from model_config.
-        cwd = "."
+        cwd = _normalize_session_cwd(".")
         requested_provider = row.get("billing_provider")
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
@@ -467,6 +476,7 @@ class SessionManager:
         except Exception:
             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 
+        cwd = _normalize_session_cwd(cwd)
         _register_task_cwd(session_id, cwd)
         agent = AIAgent(**kwargs)
         # ACP stdio transport requires stdout to remain protocol-only JSON-RPC.

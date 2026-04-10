@@ -54,6 +54,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from openai import OpenAI
 
 from agent.credential_pool import load_pool
+from agent.openai_model_features import is_gpt54_family_model
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 
@@ -2080,19 +2081,35 @@ def _is_responses_unsupported_error(exc: Exception) -> bool:
     return any(marker in message for marker in unsupported_markers)
 
 
-def _should_use_responses_api(task: Optional[str], provider: Optional[str], client: Any, tools: Optional[list] = None) -> bool:
+def _should_use_responses_api(
+    task: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+    client: Any,
+    tools: Optional[list] = None,
+) -> bool:
     """Decide whether an auxiliary task should use the Responses API."""
     provider_name = (provider or "").strip().lower()
     if tools:
         return False
+    if not hasattr(client, "responses"):
+        return False
+    if is_gpt54_family_model(model):
+        return True
     if task != "compression":
         return False
     if provider_name not in {"custom", "local/custom"} and "custom" not in provider_name:
         return False
-    return hasattr(client, "responses")
+    return True
 
 
-def _invoke_responses_request(client: Any, kwargs: dict, *, task: Optional[str] = None) -> Any:
+def _invoke_responses_request(
+    client: Any,
+    kwargs: dict,
+    *,
+    task: Optional[str] = None,
+    allow_chat_fallback: bool = True,
+) -> Any:
     """Execute one auxiliary Responses API request and normalize the result."""
     response_kwargs: Dict[str, Any] = {
         "model": kwargs["model"],
@@ -2116,6 +2133,11 @@ def _invoke_responses_request(client: Any, kwargs: dict, *, task: Optional[str] 
     except Exception as exc:
         if not _is_responses_unsupported_error(exc):
             raise
+        if not allow_chat_fallback:
+            raise RuntimeError(
+                f"Auxiliary {task or 'call'} requires the Responses API for model {kwargs.get('model')}, "
+                "but the configured endpoint does not support /responses."
+            ) from exc
         logger.info(
             "Auxiliary %s: Responses API unavailable on custom endpoint, falling back to chat.completions (%s)",
             task or "call",
@@ -2126,7 +2148,13 @@ def _invoke_responses_request(client: Any, kwargs: dict, *, task: Optional[str] 
     return _normalize_responses_to_chat_completion(raw_response, fallback_model=kwargs.get("model"))
 
 
-async def _invoke_responses_request_async(client: Any, kwargs: dict, *, task: Optional[str] = None) -> Any:
+async def _invoke_responses_request_async(
+    client: Any,
+    kwargs: dict,
+    *,
+    task: Optional[str] = None,
+    allow_chat_fallback: bool = True,
+) -> Any:
     """Execute one auxiliary Responses API request asynchronously and normalize the result."""
     response_kwargs: Dict[str, Any] = {
         "model": kwargs["model"],
@@ -2150,6 +2178,11 @@ async def _invoke_responses_request_async(client: Any, kwargs: dict, *, task: Op
     except Exception as exc:
         if not _is_responses_unsupported_error(exc):
             raise
+        if not allow_chat_fallback:
+            raise RuntimeError(
+                f"Auxiliary {task or 'call'} requires the Responses API for model {kwargs.get('model')}, "
+                "but the configured endpoint does not support /responses."
+            ) from exc
         logger.info(
             "Auxiliary %s: Responses API unavailable on custom endpoint, falling back to chat.completions (%s)",
             task or "call",
@@ -2271,14 +2304,20 @@ def call_llm(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=extra_body,
         base_url=resolved_base_url)
-    use_responses_api = _should_use_responses_api(task, resolved_provider, client, tools)
+    use_responses_api = _should_use_responses_api(task, resolved_provider, final_model, client, tools)
+    allow_chat_fallback = not is_gpt54_family_model(final_model)
     if use_responses_api:
         logger.info("Auxiliary %s: routing request through Responses API", task or "call")
 
     # Handle max_tokens vs max_completion_tokens retry, then payment fallback.
     try:
         if use_responses_api:
-            return _invoke_responses_request(client, kwargs, task=task)
+            return _invoke_responses_request(
+                client,
+                kwargs,
+                task=task,
+                allow_chat_fallback=allow_chat_fallback,
+            )
         return client.chat.completions.create(**kwargs)
     except Exception as first_err:
         if not use_responses_api:
@@ -2320,8 +2359,14 @@ def call_llm(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=extra_body)
-                if _should_use_responses_api(task, fb_label, fb_client, tools):
-                    return _invoke_responses_request(fb_client, fb_kwargs, task=task)
+                fb_use_responses_api = _should_use_responses_api(task, fb_label, fb_model, fb_client, tools)
+                if fb_use_responses_api:
+                    return _invoke_responses_request(
+                        fb_client,
+                        fb_kwargs,
+                        task=task,
+                        allow_chat_fallback=not is_gpt54_family_model(fb_model),
+                    )
                 return fb_client.chat.completions.create(**fb_kwargs)
         raise
 
@@ -2461,13 +2506,19 @@ async def async_call_llm(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=extra_body,
         base_url=resolved_base_url)
-    use_responses_api = _should_use_responses_api(task, resolved_provider, client, tools)
+    use_responses_api = _should_use_responses_api(task, resolved_provider, final_model, client, tools)
+    allow_chat_fallback = not is_gpt54_family_model(final_model)
     if use_responses_api:
         logger.info("Auxiliary %s: routing async request through Responses API", task or "call")
 
     try:
         if use_responses_api:
-            return await _invoke_responses_request_async(client, kwargs, task=task)
+            return await _invoke_responses_request_async(
+                client,
+                kwargs,
+                task=task,
+                allow_chat_fallback=allow_chat_fallback,
+            )
         return await client.chat.completions.create(**kwargs)
     except Exception as first_err:
         if not use_responses_api:

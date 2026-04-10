@@ -13,6 +13,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+from hermes_cli.cwd import resolve_runtime_cwd
 from typing import Optional
 
 from agent.skill_utils import (
@@ -964,7 +965,7 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
     loaded via ``load_soul_md()`` for the identity slot).
     """
     if cwd is None:
-        cwd = os.getcwd()
+        cwd = resolve_runtime_cwd()
 
     cwd_path = Path(cwd).resolve()
     sections = []

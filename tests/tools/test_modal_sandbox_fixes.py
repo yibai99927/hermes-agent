@@ -112,15 +112,17 @@ class TestCwdHandling:
             f"Backend {backend}: expected /root default, got {config['cwd']}"
         )
 
-    def test_docker_default_cwd_maps_current_directory_when_enabled(self, monkeypatch):
+    def test_docker_default_cwd_maps_current_directory_when_enabled(self, monkeypatch, tmp_path):
         """Docker should use /workspace when cwd mounting is explicitly enabled."""
-        monkeypatch.setattr("tools.terminal_tool.os.getcwd", lambda: "/home/user/project")
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        monkeypatch.setattr("hermes_cli.cwd.os.getcwd", lambda: str(project_dir))
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
         config = _tt_mod._get_env_config()
         assert config["cwd"] == "/workspace"
-        assert config["host_cwd"] == "/home/user/project"
+        assert config["host_cwd"] == str(project_dir)
 
     def test_local_backend_uses_getcwd(self, monkeypatch):
         """Local backend should use os.getcwd(), not /root."""
