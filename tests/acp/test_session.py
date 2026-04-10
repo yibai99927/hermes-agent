@@ -42,6 +42,14 @@ class TestCreateSession:
         state = manager.create_session(cwd="/tmp/work")
         assert calls == [(state.session_id, "/tmp/work")]
 
+    def test_create_session_normalizes_dot_cwd_from_terminal_env(self, manager, monkeypatch):
+        monkeypatch.setenv("TERMINAL_CWD", "/tmp/project")
+        calls = []
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: calls.append((task_id, cwd)))
+        state = manager.create_session(cwd=".")
+        assert state.cwd == "/tmp/project"
+        assert calls == [(state.session_id, "/tmp/project")]
+
     def test_session_ids_are_unique(self, manager):
         s1 = manager.create_session()
         s2 = manager.create_session()

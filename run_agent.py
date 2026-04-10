@@ -92,6 +92,7 @@ from agent.model_metadata import (
     query_ollama_num_ctx,
 )
 from agent.context_compressor import ContextCompressor
+from agent.openai_model_features import is_gpt54_family_model
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
@@ -796,6 +797,11 @@ class AIAgent:
                 )
             )
         ):
+            self.api_mode = "codex_responses"
+
+        # Current GPT-5.4 family models must use the Responses API even when
+        # the request is routed through a custom OpenAI-compatible endpoint.
+        if self.api_mode == "chat_completions" and is_gpt54_family_model(self.model):
             self.api_mode = "codex_responses"
 
         # Pre-warm OpenRouter model metadata cache in a background thread.
@@ -1728,6 +1734,8 @@ class AIAgent:
         # ── Determine api_mode if not provided ──
         if not api_mode:
             api_mode = determine_api_mode(new_provider, base_url)
+        if api_mode == "chat_completions" and is_gpt54_family_model(new_model):
+            api_mode = "codex_responses"
 
         # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
         # /v1 into the anthropic_messages client, which would cause the SDK to
