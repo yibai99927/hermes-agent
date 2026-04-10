@@ -1991,6 +1991,175 @@ def _build_call_kwargs(
     return kwargs
 
 
+def _responses_item_get(obj: Any, key: str, default: Any = None) -> Any:
+    """Read an attribute or dict key from a Responses API object."""
+    value = getattr(obj, key, None)
+    if value is None and isinstance(obj, dict):
+        value = obj.get(key, default)
+    return value if value is not None else default
+
+
+def _messages_to_responses_input(messages: list) -> list:
+    """Convert chat.completions-style messages to Responses API input items."""
+    converted: List[Dict[str, Any]] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "user").strip() or "user"
+        # Auxiliary Responses usage is currently scoped to compression summaries,
+        # which send plain conversational turns. Preserve unknown roles as user
+        # rather than failing the request.
+        if role not in {"system", "user", "assistant", "developer"}:
+            role = "user"
+        converted.append({
+            "role": role,
+            "content": _convert_content_for_responses(msg.get("content", "")),
+        })
+    return converted
+
+
+def _normalize_responses_to_chat_completion(response: Any, *, fallback_model: Optional[str] = None) -> Any:
+    """Wrap a Responses API result in a chat.completions-like object."""
+    text_parts: List[str] = []
+
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        text_parts.append(output_text)
+    else:
+        for item in getattr(response, "output", []) or []:
+            if _responses_item_get(item, "type") != "message":
+                continue
+            for part in (_responses_item_get(item, "content") or []):
+                if _responses_item_get(part, "type") in ("output_text", "text"):
+                    text = _responses_item_get(part, "text", "")
+                    if text:
+                        text_parts.append(str(text))
+
+    resp_usage = getattr(response, "usage", None)
+    usage = None
+    if resp_usage:
+        prompt_tokens = getattr(resp_usage, "input_tokens", 0) or 0
+        completion_tokens = getattr(resp_usage, "output_tokens", 0) or 0
+        total_tokens = getattr(resp_usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
+        usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+
+    message = SimpleNamespace(
+        role="assistant",
+        content=("".join(text_parts).strip() or None),
+        tool_calls=None,
+    )
+    choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
+    return SimpleNamespace(
+        choices=[choice],
+        model=getattr(response, "model", None) or fallback_model,
+        usage=usage,
+        raw_response=response,
+    )
+
+
+def _is_responses_unsupported_error(exc: Exception) -> bool:
+    """Return True when a custom endpoint rejects the /responses surface."""
+    status = getattr(exc, "status_code", None)
+    message = str(exc).lower()
+    if status == 404:
+        return True
+    if "responses" not in message:
+        return False
+    unsupported_markers = (
+        "not found",
+        "unknown",
+        "unsupported",
+        "no route",
+        "invalid url",
+        "does not exist",
+    )
+    return any(marker in message for marker in unsupported_markers)
+
+
+def _should_use_responses_api(task: Optional[str], provider: Optional[str], client: Any, tools: Optional[list] = None) -> bool:
+    """Decide whether an auxiliary task should use the Responses API."""
+    provider_name = (provider or "").strip().lower()
+    if tools:
+        return False
+    if task != "compression":
+        return False
+    if provider_name not in {"custom", "local/custom"} and "custom" not in provider_name:
+        return False
+    return hasattr(client, "responses")
+
+
+def _invoke_responses_request(client: Any, kwargs: dict, *, task: Optional[str] = None) -> Any:
+    """Execute one auxiliary Responses API request and normalize the result."""
+    response_kwargs: Dict[str, Any] = {
+        "model": kwargs["model"],
+        "input": _messages_to_responses_input(kwargs.get("messages", [])),
+        "timeout": kwargs.get("timeout"),
+    }
+    if "temperature" in kwargs:
+        response_kwargs["temperature"] = kwargs["temperature"]
+    max_output_tokens = (
+        kwargs.get("max_output_tokens")
+        or kwargs.get("max_completion_tokens")
+        or kwargs.get("max_tokens")
+    )
+    if max_output_tokens is not None:
+        response_kwargs["max_output_tokens"] = max_output_tokens
+    if kwargs.get("extra_body"):
+        response_kwargs["extra_body"] = kwargs["extra_body"]
+
+    try:
+        raw_response = client.responses.create(**response_kwargs)
+    except Exception as exc:
+        if not _is_responses_unsupported_error(exc):
+            raise
+        logger.info(
+            "Auxiliary %s: Responses API unavailable on custom endpoint, falling back to chat.completions (%s)",
+            task or "call",
+            exc,
+        )
+        return client.chat.completions.create(**kwargs)
+
+    return _normalize_responses_to_chat_completion(raw_response, fallback_model=kwargs.get("model"))
+
+
+async def _invoke_responses_request_async(client: Any, kwargs: dict, *, task: Optional[str] = None) -> Any:
+    """Execute one auxiliary Responses API request asynchronously and normalize the result."""
+    response_kwargs: Dict[str, Any] = {
+        "model": kwargs["model"],
+        "input": _messages_to_responses_input(kwargs.get("messages", [])),
+        "timeout": kwargs.get("timeout"),
+    }
+    if "temperature" in kwargs:
+        response_kwargs["temperature"] = kwargs["temperature"]
+    max_output_tokens = (
+        kwargs.get("max_output_tokens")
+        or kwargs.get("max_completion_tokens")
+        or kwargs.get("max_tokens")
+    )
+    if max_output_tokens is not None:
+        response_kwargs["max_output_tokens"] = max_output_tokens
+    if kwargs.get("extra_body"):
+        response_kwargs["extra_body"] = kwargs["extra_body"]
+
+    try:
+        raw_response = await client.responses.create(**response_kwargs)
+    except Exception as exc:
+        if not _is_responses_unsupported_error(exc):
+            raise
+        logger.info(
+            "Auxiliary %s: Responses API unavailable on custom endpoint, falling back to chat.completions (%s)",
+            task or "call",
+            exc,
+        )
+        return await client.chat.completions.create(**kwargs)
+
+    return _normalize_responses_to_chat_completion(raw_response, fallback_model=kwargs.get("model"))
+
+
 def call_llm(
     task: str = None,
     *,
@@ -2102,23 +2271,29 @@ def call_llm(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=extra_body,
         base_url=resolved_base_url)
+    use_responses_api = _should_use_responses_api(task, resolved_provider, client, tools)
+    if use_responses_api:
+        logger.info("Auxiliary %s: routing request through Responses API", task or "call")
 
     # Handle max_tokens vs max_completion_tokens retry, then payment fallback.
     try:
+        if use_responses_api:
+            return _invoke_responses_request(client, kwargs, task=task)
         return client.chat.completions.create(**kwargs)
     except Exception as first_err:
-        err_str = str(first_err)
-        if "max_tokens" in err_str or "unsupported_parameter" in err_str:
-            kwargs.pop("max_tokens", None)
-            kwargs["max_completion_tokens"] = max_tokens
-            try:
-                return client.chat.completions.create(**kwargs)
-            except Exception as retry_err:
-                # If the max_tokens retry also hits a payment error,
-                # fall through to the payment fallback below.
-                if not _is_payment_error(retry_err):
-                    raise
-                first_err = retry_err
+        if not use_responses_api:
+            err_str = str(first_err)
+            if "max_tokens" in err_str or "unsupported_parameter" in err_str:
+                kwargs.pop("max_tokens", None)
+                kwargs["max_completion_tokens"] = max_tokens
+                try:
+                    return client.chat.completions.create(**kwargs)
+                except Exception as retry_err:
+                    # If the max_tokens retry also hits a payment error,
+                    # fall through to the payment fallback below.
+                    if not _is_payment_error(retry_err):
+                        raise
+                    first_err = retry_err
 
         # ── Payment / credit exhaustion fallback ──────────────────────
         # When the resolved provider returns 402 or a credit-related error,
@@ -2145,6 +2320,8 @@ def call_llm(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=extra_body)
+                if _should_use_responses_api(task, fb_label, fb_client, tools):
+                    return _invoke_responses_request(fb_client, fb_kwargs, task=task)
                 return fb_client.chat.completions.create(**fb_kwargs)
         raise
 
@@ -2284,13 +2461,19 @@ async def async_call_llm(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=extra_body,
         base_url=resolved_base_url)
+    use_responses_api = _should_use_responses_api(task, resolved_provider, client, tools)
+    if use_responses_api:
+        logger.info("Auxiliary %s: routing async request through Responses API", task or "call")
 
     try:
+        if use_responses_api:
+            return await _invoke_responses_request_async(client, kwargs, task=task)
         return await client.chat.completions.create(**kwargs)
     except Exception as first_err:
-        err_str = str(first_err)
-        if "max_tokens" in err_str or "unsupported_parameter" in err_str:
-            kwargs.pop("max_tokens", None)
-            kwargs["max_completion_tokens"] = max_tokens
-            return await client.chat.completions.create(**kwargs)
+        if not use_responses_api:
+            err_str = str(first_err)
+            if "max_tokens" in err_str or "unsupported_parameter" in err_str:
+                kwargs.pop("max_tokens", None)
+                kwargs["max_completion_tokens"] = max_tokens
+                return await client.chat.completions.create(**kwargs)
         raise
