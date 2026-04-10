@@ -46,6 +46,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from openai import OpenAI
 
 from agent.credential_pool import load_pool
+from agent.openai_model_features import is_gpt54_family_model
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 
@@ -2349,6 +2350,204 @@ def _build_call_kwargs(
     return kwargs
 
 
+def _responses_item_get(obj: Any, key: str, default: Any = None) -> Any:
+    """Read an attribute or dict key from a Responses API object."""
+    value = getattr(obj, key, None)
+    if value is None and isinstance(obj, dict):
+        value = obj.get(key, default)
+    return value if value is not None else default
+
+
+def _messages_to_responses_input(messages: list) -> list:
+    """Convert chat.completions-style messages to Responses API input items."""
+    converted: List[Dict[str, Any]] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "user").strip() or "user"
+        if role not in {"system", "user", "assistant", "developer"}:
+            role = "user"
+        converted.append({
+            "role": role,
+            "content": _convert_content_for_responses(msg.get("content", "")),
+        })
+    return converted
+
+
+def _normalize_responses_to_chat_completion(response: Any, *, fallback_model: Optional[str] = None) -> Any:
+    """Wrap a Responses API result in a chat.completions-like object."""
+    text_parts: List[str] = []
+
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        text_parts.append(output_text)
+    else:
+        for item in getattr(response, "output", []) or []:
+            if _responses_item_get(item, "type") != "message":
+                continue
+            for part in (_responses_item_get(item, "content") or []):
+                if _responses_item_get(part, "type") in ("output_text", "text"):
+                    text = _responses_item_get(part, "text", "")
+                    if text:
+                        text_parts.append(str(text))
+
+    resp_usage = getattr(response, "usage", None)
+    usage = None
+    if resp_usage:
+        prompt_tokens = getattr(resp_usage, "input_tokens", 0) or 0
+        completion_tokens = getattr(resp_usage, "output_tokens", 0) or 0
+        total_tokens = getattr(resp_usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
+        usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+
+    message = SimpleNamespace(
+        role="assistant",
+        content=("".join(text_parts).strip() or None),
+        tool_calls=None,
+    )
+    choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
+    return SimpleNamespace(
+        choices=[choice],
+        model=getattr(response, "model", None) or fallback_model,
+        usage=usage,
+        raw_response=response,
+    )
+
+
+def _is_responses_unsupported_error(exc: Exception) -> bool:
+    """Return True when a custom endpoint rejects the /responses surface."""
+    status = getattr(exc, "status_code", None)
+    message = str(exc).lower()
+    if status == 404:
+        return True
+    if "responses" not in message:
+        return False
+    unsupported_markers = (
+        "not found",
+        "unknown",
+        "unsupported",
+        "no route",
+        "invalid url",
+        "does not exist",
+    )
+    return any(marker in message for marker in unsupported_markers)
+
+
+def _should_use_responses_api(
+    task: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+    client: Any,
+    tools: Optional[list] = None,
+) -> bool:
+    """Decide whether an auxiliary task should use the Responses API."""
+    provider_name = (provider or "").strip().lower()
+    if tools:
+        return False
+    if not hasattr(client, "responses"):
+        return False
+    if is_gpt54_family_model(model):
+        return True
+    if task != "compression":
+        return False
+    if provider_name not in {"custom", "local/custom"} and "custom" not in provider_name:
+        return False
+    return True
+
+
+def _invoke_responses_request(
+    client: Any,
+    kwargs: dict,
+    *,
+    task: Optional[str] = None,
+    allow_chat_fallback: bool = True,
+) -> Any:
+    """Execute one auxiliary Responses API request and normalize the result."""
+    response_kwargs: Dict[str, Any] = {
+        "model": kwargs["model"],
+        "input": _messages_to_responses_input(kwargs.get("messages", [])),
+        "timeout": kwargs.get("timeout"),
+    }
+    if "temperature" in kwargs:
+        response_kwargs["temperature"] = kwargs["temperature"]
+    max_output_tokens = (
+        kwargs.get("max_output_tokens")
+        or kwargs.get("max_completion_tokens")
+        or kwargs.get("max_tokens")
+    )
+    if max_output_tokens is not None:
+        response_kwargs["max_output_tokens"] = max_output_tokens
+    if kwargs.get("extra_body"):
+        response_kwargs["extra_body"] = kwargs["extra_body"]
+
+    try:
+        raw_response = client.responses.create(**response_kwargs)
+    except Exception as exc:
+        if not _is_responses_unsupported_error(exc):
+            raise
+        if not allow_chat_fallback:
+            raise RuntimeError(
+                f"Auxiliary {task or 'call'} requires the Responses API for model {kwargs.get('model')}, "
+                "but the configured endpoint does not support /responses."
+            ) from exc
+        logger.info(
+            "Auxiliary %s: Responses API unavailable on custom endpoint, falling back to chat.completions (%s)",
+            task or "call",
+            exc,
+        )
+        return client.chat.completions.create(**kwargs)
+
+    return _normalize_responses_to_chat_completion(raw_response, fallback_model=kwargs.get("model"))
+
+
+async def _invoke_responses_request_async(
+    client: Any,
+    kwargs: dict,
+    *,
+    task: Optional[str] = None,
+    allow_chat_fallback: bool = True,
+) -> Any:
+    """Execute one auxiliary Responses API request asynchronously and normalize the result."""
+    response_kwargs: Dict[str, Any] = {
+        "model": kwargs["model"],
+        "input": _messages_to_responses_input(kwargs.get("messages", [])),
+        "timeout": kwargs.get("timeout"),
+    }
+    if "temperature" in kwargs:
+        response_kwargs["temperature"] = kwargs["temperature"]
+    max_output_tokens = (
+        kwargs.get("max_output_tokens")
+        or kwargs.get("max_completion_tokens")
+        or kwargs.get("max_tokens")
+    )
+    if max_output_tokens is not None:
+        response_kwargs["max_output_tokens"] = max_output_tokens
+    if kwargs.get("extra_body"):
+        response_kwargs["extra_body"] = kwargs["extra_body"]
+
+    try:
+        raw_response = await client.responses.create(**response_kwargs)
+    except Exception as exc:
+        if not _is_responses_unsupported_error(exc):
+            raise
+        if not allow_chat_fallback:
+            raise RuntimeError(
+                f"Auxiliary {task or 'call'} requires the Responses API for model {kwargs.get('model')}, "
+                "but the configured endpoint does not support /responses."
+            ) from exc
+        logger.info(
+            "Auxiliary %s: Responses API unavailable on custom endpoint, falling back to chat.completions (%s)",
+            task or "call",
+            exc,
+        )
+        return await client.chat.completions.create(**kwargs)
+
+    return _normalize_responses_to_chat_completion(raw_response, fallback_model=kwargs.get("model"))
+
+
 def _validate_llm_response(response: Any, task: str = None) -> Any:
     """Validate that an LLM response has the expected .choices[0].message shape.
 
@@ -2362,8 +2561,6 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
         raise RuntimeError(
             f"Auxiliary {task or 'call'}: LLM returned None response"
         )
-    # Allow SimpleNamespace responses from adapters (CodexAuxiliaryClient,
-    # AnthropicAuxiliaryClient) — they have .choices[0].message.
     try:
         choices = response.choices
         if not choices or not hasattr(choices[0], "message"):
@@ -2456,9 +2653,6 @@ def call_llm(
             main_runtime=main_runtime,
         )
         if client is None:
-            # When the user explicitly chose a non-OpenRouter provider but no
-            # credentials were found, fail fast instead of silently routing
-            # through OpenRouter (which causes confusing 404s).
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in ("auto", "openrouter", "custom"):
                 raise RuntimeError(
@@ -2466,11 +2660,6 @@ def call_llm(
                     f"was found. Set the {_explicit.upper()}_API_KEY environment "
                     f"variable, or switch to a different provider with `hermes model`."
                 )
-            # For auto/custom with no credentials, try the full auto chain
-            # rather than hardcoding OpenRouter (which may be depleted).
-            # Pass model=None so each provider uses its own default —
-            # resolved_model may be an OpenRouter-format slug that doesn't
-            # work on other providers.
             if not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
@@ -2482,12 +2671,11 @@ def call_llm(
 
     effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
 
-    # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
     if task:
         logger.info("Auxiliary %s: using %s (%s)%s",
-                     task, resolved_provider or "auto", final_model or "default",
-                     f" at {_base_info}" if _base_info and "openrouter" not in _base_info else "")
+                    task, resolved_provider or "auto", final_model or "default",
+                    f" at {_base_info}" if _base_info and "openrouter" not in _base_info else "")
 
     kwargs = _build_call_kwargs(
         resolved_provider, final_model, messages,
@@ -2495,46 +2683,41 @@ def call_llm(
         tools=tools, timeout=effective_timeout, extra_body=extra_body,
         base_url=resolved_base_url)
 
-    # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
-    # Handle max_tokens vs max_completion_tokens retry, then payment fallback.
-    try:
-        return _validate_llm_response(
-            client.chat.completions.create(**kwargs), task)
-    except Exception as first_err:
-        err_str = str(first_err)
-        if "max_tokens" in err_str or "unsupported_parameter" in err_str:
-            kwargs.pop("max_tokens", None)
-            kwargs["max_completion_tokens"] = max_tokens
-            try:
-                return _validate_llm_response(
-                    client.chat.completions.create(**kwargs), task)
-            except Exception as retry_err:
-                # If the max_tokens retry also hits a payment or connection
-                # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
-                    raise
-                first_err = retry_err
+    use_responses_api = _should_use_responses_api(task, resolved_provider, final_model, client, tools)
+    allow_chat_fallback = not is_gpt54_family_model(final_model)
+    if use_responses_api:
+        logger.info("Auxiliary %s: routing request through Responses API", task or "call")
 
-        # ── Payment / credit exhaustion fallback ──────────────────────
-        # When the resolved provider returns 402 or a credit-related error,
-        # try alternative providers instead of giving up.  This handles the
-        # common case where a user runs out of OpenRouter credits but has
-        # Codex OAuth or another provider available.
-        #
-        # ── Connection error fallback ────────────────────────────────
-        # When a provider endpoint is unreachable (DNS failure, connection
-        # refused, timeout), try alternative providers.  This handles stale
-        # Codex/OAuth tokens that authenticate but whose endpoint is down,
-        # and providers the user never configured that got picked up by
-        # the auto-detection chain.
+    try:
+        if use_responses_api:
+            return _validate_llm_response(
+                _invoke_responses_request(
+                    client,
+                    kwargs,
+                    task=task,
+                    allow_chat_fallback=allow_chat_fallback,
+                ),
+                task,
+            )
+        return _validate_llm_response(client.chat.completions.create(**kwargs), task)
+    except Exception as first_err:
+        if not use_responses_api:
+            err_str = str(first_err)
+            if "max_tokens" in err_str or "unsupported_parameter" in err_str:
+                kwargs.pop("max_tokens", None)
+                kwargs["max_completion_tokens"] = max_tokens
+                try:
+                    return _validate_llm_response(client.chat.completions.create(**kwargs), task)
+                except Exception as retry_err:
+                    if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
+                        raise
+                    first_err = retry_err
+
         should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
-        # Only try alternative providers when the user didn't explicitly
-        # configure this task's provider.  Explicit provider = hard constraint;
-        # auto (the default) = best-effort fallback chain.  (#7559)
         is_auto = resolved_provider in ("auto", "", None)
         if should_fallback and is_auto:
             reason = "payment error" if _is_payment_error(first_err) else "connection error"
@@ -2548,8 +2731,21 @@ def call_llm(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=extra_body)
-                return _validate_llm_response(
-                    fb_client.chat.completions.create(**fb_kwargs), task)
+                fb_client_base = str(getattr(fb_client, "base_url", "") or "")
+                if _is_anthropic_compat_endpoint(fb_label, fb_client_base):
+                    fb_kwargs["messages"] = _convert_openai_images_to_anthropic(fb_kwargs["messages"])
+                fb_use_responses_api = _should_use_responses_api(task, fb_label, fb_model, fb_client, tools)
+                if fb_use_responses_api:
+                    return _validate_llm_response(
+                        _invoke_responses_request(
+                            fb_client,
+                            fb_kwargs,
+                            task=task,
+                            allow_chat_fallback=not is_gpt54_family_model(fb_model),
+                        ),
+                        task,
+                    )
+                return _validate_llm_response(fb_client.chat.completions.create(**fb_kwargs), task)
         raise
 
 
@@ -2688,30 +2884,40 @@ async def async_call_llm(
         tools=tools, timeout=effective_timeout, extra_body=extra_body,
         base_url=resolved_base_url)
 
-    # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
-    try:
-        return _validate_llm_response(
-            await client.chat.completions.create(**kwargs), task)
-    except Exception as first_err:
-        err_str = str(first_err)
-        if "max_tokens" in err_str or "unsupported_parameter" in err_str:
-            kwargs.pop("max_tokens", None)
-            kwargs["max_completion_tokens"] = max_tokens
-            try:
-                return _validate_llm_response(
-                    await client.chat.completions.create(**kwargs), task)
-            except Exception as retry_err:
-                # If the max_tokens retry also hits a payment or connection
-                # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
-                    raise
-                first_err = retry_err
+    use_responses_api = _should_use_responses_api(task, resolved_provider, final_model, client, tools)
+    allow_chat_fallback = not is_gpt54_family_model(final_model)
+    if use_responses_api:
+        logger.info("Auxiliary %s: routing async request through Responses API", task or "call")
 
-        # ── Payment / connection fallback (mirrors sync call_llm) ─────
+    try:
+        if use_responses_api:
+            return _validate_llm_response(
+                await _invoke_responses_request_async(
+                    client,
+                    kwargs,
+                    task=task,
+                    allow_chat_fallback=allow_chat_fallback,
+                ),
+                task,
+            )
+        return _validate_llm_response(await client.chat.completions.create(**kwargs), task)
+    except Exception as first_err:
+        if not use_responses_api:
+            err_str = str(first_err)
+            if "max_tokens" in err_str or "unsupported_parameter" in err_str:
+                kwargs.pop("max_tokens", None)
+                kwargs["max_completion_tokens"] = max_tokens
+                try:
+                    return _validate_llm_response(await client.chat.completions.create(**kwargs), task)
+                except Exception as retry_err:
+                    if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
+                        raise
+                    first_err = retry_err
+
         should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
         is_auto = resolved_provider in ("auto", "", None)
         if should_fallback and is_auto:
@@ -2726,10 +2932,23 @@ async def async_call_llm(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=extra_body)
-                # Convert sync fallback client to async
                 async_fb, async_fb_model = _to_async_client(fb_client, fb_model or "")
                 if async_fb_model and async_fb_model != fb_kwargs.get("model"):
                     fb_kwargs["model"] = async_fb_model
-                return _validate_llm_response(
-                    await async_fb.chat.completions.create(**fb_kwargs), task)
+                fb_client_base = str(getattr(async_fb, "base_url", "") or getattr(fb_client, "base_url", "") or "")
+                if _is_anthropic_compat_endpoint(fb_label, fb_client_base):
+                    fb_kwargs["messages"] = _convert_openai_images_to_anthropic(fb_kwargs["messages"])
+                fb_use_responses_api = _should_use_responses_api(task, fb_label, fb_kwargs.get("model"), async_fb, tools)
+                if fb_use_responses_api:
+                    return _validate_llm_response(
+                        await _invoke_responses_request_async(
+                            async_fb,
+                            fb_kwargs,
+                            task=task,
+                            allow_chat_fallback=not is_gpt54_family_model(fb_kwargs.get("model")),
+                        ),
+                        task,
+                    )
+                return _validate_llm_response(await async_fb.chat.completions.create(**fb_kwargs), task)
         raise
+

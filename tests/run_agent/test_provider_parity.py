@@ -44,7 +44,13 @@ class _FakeOpenAI:
         pass
 
 
-def _make_agent(monkeypatch, provider, api_mode="chat_completions", base_url="https://openrouter.ai/api/v1", model=None):
+def _make_agent(
+    monkeypatch,
+    provider,
+    api_mode="chat_completions",
+    base_url="https://openrouter.ai/api/v1",
+    model=None,
+):
     monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kw: _tool_defs("web_search", "terminal"))
     monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
     monkeypatch.setattr("run_agent.OpenAI", _FakeOpenAI)
@@ -58,12 +64,43 @@ def _make_agent(monkeypatch, provider, api_mode="chat_completions", base_url="ht
         skip_context_files=True,
         skip_memory=True,
     )
-    if model:
+    if model is not None:
         kwargs["model"] = model
     base_url="https://openrouter.ai/api/v1",
     api_key="test-key",
     base_url="https://openrouter.ai/api/v1",
     return AIAgent(**kwargs)
+
+
+class TestGpt54ResponsesRouting:
+    def test_custom_gpt54_forces_responses_api(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            api_mode="chat_completions",
+            base_url="https://api.novacode.top/v1",
+            model="gpt-5.4",
+        )
+        assert agent.api_mode == "codex_responses"
+
+    def test_switch_model_to_gpt54_forces_responses_api(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            api_mode="chat_completions",
+            base_url="https://api.novacode.top/v1",
+            model="deepseek-chat",
+        )
+
+        agent.switch_model(
+            "gpt-5.4-mini",
+            "custom",
+            api_key="test-key",
+            base_url="https://api.novacode.top/v1",
+            api_mode="chat_completions",
+        )
+
+        assert agent.api_mode == "codex_responses"
 
 
 # ── _build_api_kwargs tests ─────────────────────────────────────────────────

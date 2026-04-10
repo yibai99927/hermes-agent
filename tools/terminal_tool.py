@@ -44,6 +44,8 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+from hermes_cli.cwd import resolve_runtime_cwd
+
 logger = logging.getLogger(__name__)
 
 
@@ -607,7 +609,7 @@ def _get_env_config() -> Dict[str, Any]:
     # else starts in the user's home (~ resolves to whatever account
     # is running inside the container/remote).
     if env_type == "local":
-        default_cwd = os.getcwd()
+        default_cwd = resolve_runtime_cwd()
     elif env_type == "ssh":
         default_cwd = "~"
     else:
@@ -621,7 +623,7 @@ def _get_env_config() -> Dict[str, Any]:
     host_cwd = None
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
+        docker_cwd_source = os.getenv("TERMINAL_CWD") or resolve_runtime_cwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in host_prefixes)
