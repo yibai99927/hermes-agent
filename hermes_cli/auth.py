@@ -331,6 +331,11 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
     cleaned = value.strip()
     if len(cleaned) < min_length:
         return False
+    # Hermes commonly masks secrets as prefix...suffix when logging or when a
+    # user copies a redacted value back into config. Treat these masked strings
+    # as unusable so they never enter runtime routing or credential pools.
+    if "..." in cleaned:
+        return False
     if cleaned.lower() in _PLACEHOLDER_SECRET_VALUES:
         return False
     return True
