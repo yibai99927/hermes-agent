@@ -16,6 +16,7 @@ from hermes_cli.auth import (
     AuthError,
     KIMI_CODE_BASE_URL,
     _resolve_kimi_base_url,
+    has_usable_secret,
 )
 from hermes_cli.copilot_auth import _try_gh_cli_token
 
@@ -23,6 +24,11 @@ from hermes_cli.copilot_auth import _try_gh_cli_token
 # =============================================================================
 # Provider Registry tests
 # =============================================================================
+
+def test_has_usable_secret_rejects_masked_prefix_suffix_value():
+    assert has_usable_secret("sk-live-secret") is True
+    assert has_usable_secret("sk-live...cret") is False
+
 
 class TestProviderRegistry:
     """Test that new providers are correctly registered."""

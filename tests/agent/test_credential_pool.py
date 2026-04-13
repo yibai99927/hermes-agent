@@ -882,6 +882,38 @@ def test_custom_endpoint_pool_seeds_from_model_config(tmp_path, monkeypatch):
     assert model_entries[0].access_token == "sk-model-key"
 
 
+def test_custom_endpoint_pool_ignores_masked_model_config_key(tmp_path, monkeypatch):
+    """Masked prefix...suffix strings must not seed model_config custom credentials."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1})
+
+    import yaml
+    config_path = tmp_path / "hermes" / "config.yaml"
+    config_path.write_text(yaml.dump({
+        "custom_providers": [
+            {
+                "name": "Together.ai",
+                "base_url": "https://api.together.ai/v1",
+                "api_key": "sk-real-config-key",
+            }
+        ],
+        "model": {
+            "provider": "custom",
+            "base_url": "https://api.together.ai/v1",
+            "api_key": "sk-realco...abcd",
+        },
+    }))
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("custom:together.ai")
+    assert pool.has_credentials()
+    entries = pool.entries()
+    assert [e.source for e in entries] == ["config:Together.ai"]
+    assert entries[0].access_token == "sk-real-config-key"
+
+
+
 def test_custom_pool_does_not_break_existing_providers(tmp_path, monkeypatch):
     """Existing registry providers work exactly as before with custom pool support."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
