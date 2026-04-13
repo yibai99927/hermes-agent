@@ -30,6 +30,7 @@ from hermes_cli.auth import (
     _resolve_zai_base_url,
     _save_auth_store,
     _save_provider_state,
+    has_usable_secret,
     read_credential_pool,
     write_credential_pool,
 )
@@ -1361,7 +1362,7 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
         api_key = str(cp_config.get("api_key") or "").strip()
         base_url = str(cp_config.get("base_url") or "").strip().rstrip("/")
         name = str(cp_config.get("name") or "").strip()
-        if api_key:
+        if has_usable_secret(api_key):
             source = f"config:{name}"
             active_sources.add(source)
             changed |= _upsert_entry(
@@ -1390,7 +1391,7 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
                 if isinstance(v, str) and v.strip():
                     model_api_key = v.strip()
                     break
-            if model_provider == "custom" and model_base_url and model_api_key:
+            if model_provider == "custom" and model_base_url and has_usable_secret(model_api_key):
                 # Check if this model's base_url matches our custom provider
                 matched_key = get_custom_provider_pool_key(model_base_url)
                 if matched_key == pool_key:
