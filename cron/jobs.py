@@ -451,6 +451,7 @@ def create_job(
         "paused_reason": None,
         "created_at": now,
         "next_run_at": compute_next_run(parsed_schedule),
+        "current_run_started_at": None,
         "last_run_at": None,
         "last_status": None,
         "last_error": None,
@@ -567,9 +568,25 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
+            "current_run_started_at": None,
             "next_run_at": _hermes_now().isoformat(),
         },
     )
+
+
+def mark_job_started(job_id: str) -> Optional[Dict[str, Any]]:
+    """Mark a job as actively running so execution is visible in storage."""
+    jobs = load_jobs()
+    for i, job in enumerate(jobs):
+        if job["id"] != job_id:
+            continue
+
+        job["state"] = "running"
+        job["current_run_started_at"] = _hermes_now().isoformat()
+        jobs[i] = job
+        save_jobs(jobs)
+        return _apply_skill_fields(job)
+    return None
 
 
 def remove_job(job_id: str) -> bool:
@@ -598,6 +615,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     for i, job in enumerate(jobs):
         if job["id"] == job_id:
             now = _hermes_now().isoformat()
+            job["current_run_started_at"] = None
             job["last_run_at"] = now
             job["last_status"] = "ok" if success else "error"
             job["last_error"] = error if not success else None

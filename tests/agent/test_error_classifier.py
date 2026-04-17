@@ -227,6 +227,28 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="openrouter")
         assert result.reason == FailoverReason.billing
 
+    def test_custom_403_bad_response_status_code_classified_as_server_error(self):
+        e = MockAPIError(
+            "Error code: 403 - {'error': {'message': 'openai_error', 'type': 'bad_response_status_code', 'code': 'bad_response_status_code'}}",
+            status_code=403,
+            body={"error": {"message": "openai_error", "type": "bad_response_status_code", "code": "bad_response_status_code"}},
+        )
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
+        assert result.should_rotate_credential is False
+
+    def test_custom_403_subscription_not_found_classified_as_server_error(self):
+        e = MockAPIError(
+            "No active subscription found for this group",
+            status_code=403,
+            body={"code": "SUBSCRIPTION_NOT_FOUND", "message": "No active subscription found for this group"},
+        )
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
+        assert result.should_rotate_credential is False
+
     # ── Billing ──
 
     def test_402_plain_billing(self):

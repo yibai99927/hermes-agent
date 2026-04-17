@@ -3,13 +3,25 @@
 import json
 import logging
 import os
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.jobs import create_job, get_job
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, tick, SILENT_MARKER, _build_job_prompt
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+@pytest.fixture()
+def tmp_cron_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    monkeypatch.setattr("cron.scheduler._LOCK_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.scheduler._LOCK_FILE", tmp_path / "cron" / ".tick.lock")
+    return tmp_path
 
 
 class TestResolveOrigin:
@@ -1214,6 +1226,73 @@ class TestBuildJobPromptMissingSkill:
             result = _build_job_prompt({"skills": ["ghost-skill", "real-skill"], "prompt": "go"})
         assert "Real skill content." in result
         assert "go" in result
+
+
+class TestTickRunningState:
+    def test_tick_marks_job_running_while_run_job_executes(self, tmp_cron_dir, monkeypatch):
+        job = create_job(prompt="Check server status", schedule="every 1h")
+
+        jobs = [job]
+        jobs[0]["next_run_at"] = (datetime.now().astimezone() - timedelta(minutes=1)).isoformat()
+
+        from cron.jobs import save_jobs
+        save_jobs(jobs)
+
+        def fake_run_job(job_data):
+            stored = get_job(job_data["id"])
+            assert stored["state"] == "running"
+            assert stored["current_run_started_at"] is not None
+            return True, "ok", "ok", None
+
+        monkeypatch.setattr("cron.scheduler.run_job", fake_run_job)
+        monkeypatch.setattr("cron.scheduler.save_job_output", lambda *_args, **_kwargs: tmp_cron_dir / "out.md")
+        monkeypatch.setattr("cron.scheduler._deliver_result", lambda *_args, **_kwargs: None)
+
+        assert tick(verbose=False) == 1
+
+        updated = get_job(job["id"])
+        assert updated["state"] == "scheduled"
+        assert updated["last_status"] == "ok"
+        assert updated["last_run_at"] is not None
+        assert updated.get("current_run_started_at") is None
+
+
+class TestTickAdvanceBeforeRun:
+    """Verify that tick() calls advance_next_run before run_job for crash safety."""
+
+    def test_advance_called_before_run_job(self, tmp_path):
+        """advance_next_run must be called before run_job to prevent crash-loop re-fires."""
+        call_order = []
+
+        def fake_advance(job_id):
+            call_order.append(("advance", job_id))
+            return True
+
+        def fake_run_job(job):
+            call_order.append(("run", job["id"]))
+            return True, "output", "response", None
+
+        fake_job = {
+            "id": "test-advance",
+            "name": "test",
+            "prompt": "hello",
+            "enabled": True,
+            "schedule": {"kind": "cron", "expr": "15 6 * * *"},
+        }
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[fake_job]), \
+             patch("cron.scheduler.advance_next_run", side_effect=fake_advance) as adv_mock, \
+             patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler._deliver_result"):
+            from cron.scheduler import tick
+            executed = tick(verbose=False)
+
+        assert executed == 1
+        adv_mock.assert_called_once_with("test-advance")
+        # advance must happen before run
+        assert call_order == [("advance", "test-advance"), ("run", "test-advance")]
 
 
 class TestSendMediaViaAdapter:

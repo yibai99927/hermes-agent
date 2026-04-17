@@ -454,6 +454,23 @@ def _classify_by_status(
                 should_rotate_credential=True,
                 should_fallback=True,
             )
+        # Custom OpenAI-compatible gateways sometimes surface upstream provider
+        # failures as HTTP 403 with wrapper codes like bad_response_status_code
+        # or messages like openai_error / subscription_not_found. Those do not
+        # mean the user's gateway key is invalid, so avoid exhausting the
+        # credential pool entry for transient upstream problems.
+        if provider == "custom" and (
+            error_code in ("bad_response_status_code", "subscription_not_found")
+            or "bad_response_status_code" in error_msg
+            or "openai_error" in error_msg
+            or "subscription_not_found" in error_msg
+            or "no active subscription found for this group" in error_msg
+        ):
+            return result_fn(
+                FailoverReason.server_error,
+                retryable=True,
+                should_fallback=True,
+            )
         return result_fn(
             FailoverReason.auth,
             retryable=False,

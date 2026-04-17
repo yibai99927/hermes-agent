@@ -76,7 +76,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import get_due_jobs, mark_job_run, mark_job_started, save_job_output, advance_next_run
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1032,6 +1032,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # process crashes mid-run, the job won't re-fire on restart.
                 # One-shot jobs are left alone so they can retry on restart.
                 advance_next_run(job["id"])
+                mark_job_started(job["id"])
 
                 success, output, final_response, error = run_job(job)
 
