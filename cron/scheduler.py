@@ -681,6 +681,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
+    _prev_hermes_home = os.environ.get("HERMES_HOME")
+
     try:
         # Inject origin context so the agent's send_message tool knows the chat.
         # Must be INSIDE the try block so the finally cleanup always runs.
@@ -689,6 +691,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             os.environ["HERMES_SESSION_CHAT_ID"] = str(origin["chat_id"])
             if origin.get("chat_name"):
                 os.environ["HERMES_SESSION_CHAT_NAME"] = origin["chat_name"]
+
+        # Keep runtime helpers pointed at the same Hermes home as this scheduler
+        # run.  Tests and cron workers often patch cron.scheduler._hermes_home
+        # directly, so we must mirror that into HERMES_HOME before resolving
+        # provider/config state downstream.
+        _prev_hermes_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(_hermes_home)
+
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart.
         from dotenv import load_dotenv
@@ -962,6 +972,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return False, output, "", error_msg
 
     finally:
+        # Restore scheduler-wide Hermes home so downstream calls don't leak this run's override.
+        if _prev_hermes_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = _prev_hermes_home
+
         # Clean up injected env vars so they don't leak to other jobs
         for key in (
             "HERMES_SESSION_PLATFORM",
