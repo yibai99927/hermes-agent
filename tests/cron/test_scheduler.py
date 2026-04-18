@@ -1389,6 +1389,51 @@ class TestBuildJobPromptMissingSkill:
         assert "Real skill content." in result
         assert "go" in result
 
+    def test_run_job_uses_scheduler_hermes_home_over_env(self, tmp_path, monkeypatch):
+        """run_job should honor the scheduler's Hermes home, not a stale env override."""
+        env_home = tmp_path / "env-home"
+        env_home.mkdir()
+        run_home = tmp_path / "run-home"
+        run_home.mkdir()
+        (run_home / "config.yaml").write_text(
+            "model:\n"
+            "  provider: custom\n"
+            "  base_url: https://api.example.invalid/v1\n"
+            "  api_key: dummy-key\n"
+            "  default: gpt-5.4\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(env_home))
+
+        job = {
+            "id": "home-override-job",
+            "name": "home override test",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", run_home), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert "ok" in output
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["provider"] == "custom"
+        assert kwargs["base_url"] == "https://api.example.invalid/v1"
+        assert kwargs["api_key"] == "dummy-key"
+
 
 class TestSendMediaViaAdapter:
     """Unit tests for _send_media_via_adapter — routes files to typed adapter methods."""
